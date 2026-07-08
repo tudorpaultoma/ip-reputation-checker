@@ -131,12 +131,45 @@ HIGH_RISK_COUNTRIES = {
     "SD", "SO", "YE", "ZW",
 }
 
-# Major / well-known cloud providers — lighter penalty (-2) since enterprises
-# routinely use them for legitimate services.
+# ---------------------------------------------------------------------------
+# Country → continent mapping for source-vs-IP geo mismatch penalty.
+# Used by country_to_continent().
+# ---------------------------------------------------------------------------
+_COUNTRY_CONTINENT: dict[str, str] = {
+    # Europe
+    "DE": "EU", "FR": "EU", "GB": "EU", "IT": "EU", "ES": "EU",
+    "NL": "EU", "BE": "EU", "CH": "EU", "AT": "EU", "PL": "EU",
+    "SE": "EU", "NO": "EU", "DK": "EU", "FI": "EU", "IE": "EU",
+    "PT": "EU", "GR": "EU", "CZ": "EU", "RO": "EU", "HU": "EU",
+    "BG": "EU", "SK": "EU", "HR": "EU", "SI": "EU", "LT": "EU",
+    "LV": "EU", "EE": "EU", "LU": "EU", "MT": "EU", "CY": "EU",
+    "IS": "EU", "UA": "EU", "RS": "EU", "MD": "EU",
+    # Asia
+    "SG": "AS", "CN": "AS", "JP": "AS", "KR": "AS", "IN": "AS",
+    "HK": "AS", "TW": "AS", "TH": "AS", "VN": "AS", "MY": "AS",
+    "ID": "AS", "PH": "AS", "PK": "AS", "BD": "AS", "KZ": "AS",
+    "AE": "AS", "SA": "AS", "QA": "AS", "KW": "AS", "OM": "AS",
+    "BH": "AS", "IL": "AS", "JO": "AS", "LB": "AS", "TR": "AS",
+    "IR": "AS", "MM": "AS", "KH": "AS", "LA": "AS",
+    # North America
+    "US": "NA", "CA": "NA", "MX": "NA", "PA": "NA", "CR": "NA",
+    "GT": "NA", "HN": "NA", "SV": "NA", "NI": "NA", "BZ": "NA",
+    # South America
+    "BR": "SA", "AR": "SA", "CL": "SA", "CO": "SA", "PE": "SA",
+    "UY": "SA", "PY": "SA", "EC": "SA", "BO": "SA", "VE": "SA",
+    # Oceania
+    "AU": "OC", "NZ": "OC",
+    # Africa
+    "ZA": "AF", "NG": "AF", "KE": "AF", "EG": "AF", "MA": "AF",
+    "GH": "AF", "TZ": "AF", "UG": "AF", "SD": "AF", "ET": "AF",
+}
+
+# Recognized cloud providers — treated as corporate/enterprise (+2).
 MAJOR_CLOUD_KEYWORDS = [
     "aws", "ec2", "amazon web services", "amazon technologies",
     "amazon data services", "azure", "google cloud", "gcp",
-    "oracle cloud", "tencent cloud", "alibaba cloud",
+    "oracle cloud", "tencent cloud", "alibaba cloud", "ali cloud",
+    "ovh",
 ]
 
 # Generic / obscure hosting — heavier penalty (-5).  These are the VPS mills
@@ -271,6 +304,15 @@ def country_name_to_code(name: str) -> str:
     if len(upper) == 2:
         return upper
     return mapping.get(name.strip().lower(), upper[:2])
+
+
+def country_to_continent(cc: str) -> str:
+    """Return continent code for a 2-letter country code.
+
+    Returns ``"EU"``, ``"AS"``, ``"NA"``, ``"SA"``, ``"OC"``, ``"AF"``,
+    or ``""`` if unrecognised.
+    """
+    return _COUNTRY_CONTINENT.get(cc.upper(), "")
 
 
 # ---------------------------------------------------------------------------
@@ -834,8 +876,8 @@ def _score_asn_type(asn: AsnResult | None, geo: GeoResult) -> tuple[int, list[st
         pos.append("residential/ISP AS (+2)")
         return 2, pos, warn
     elif is_major_cloud:
-        warn.append("major cloud provider (AWS/Azure/GCP/etc.) — common for CDN/enterprise (-2)")
-        return -2, pos, warn
+        pos.append("recognized cloud provider (+2)")
+        return 2, pos, warn
     elif is_hosting:
         warn.append("hosting/datacenter AS — common for VPNs/proxies (-5)")
         return -5, pos, warn
@@ -901,13 +943,13 @@ def compute_score(report: Report) -> int:
         pos.append(f"IP block established ({age_source}) (+3)")
         reg_score += 3
     elif alloc_age_for_scoring is not None and alloc_age_for_scoring >= 3:
-        det.append(f"IP block moderately aged ({age_source})")
+        det.append(f"IP block moderately aged ({age_source}) (-2)")
         reg_score -= 2
     elif alloc_age_for_scoring is not None and alloc_age_for_scoring <= 2:
         reg_score -= 8
         warn.append(f"IP block recently allocated ({age_source}) (-8)")
     else:
-        det.append("allocation age unknown")
+        det.append("allocation age unknown (-1)")
         reg_score -= 1
 
     # FCrDNS
@@ -917,7 +959,7 @@ def compute_score(report: Report) -> int:
     elif dns.ptr:
         det.append(f"reverse DNS set ({dns.ptr}) but no forward match")
     else:
-        det.append("no reverse DNS (PTR) record")
+        det.append("no reverse DNS (PTR) record (-3)")
         reg_score -= 3
 
     # RPKI
@@ -939,7 +981,7 @@ def compute_score(report: Report) -> int:
         pos.append(f"abuse contact published (+2)")
         reg_score += 2
     else:
-        det.append("no published abuse contact")
+        det.append("no published abuse contact (-2)")
         reg_score -= 2
 
     # BGP visibility
@@ -951,10 +993,10 @@ def compute_score(report: Report) -> int:
         elif vis >= 50:
             det.append(f"BGP visibility {vis:.0f}%")
         else:
-            det.append(f"low BGP visibility ({vis:.0f}%)")
+            det.append(f"low BGP visibility ({vis:.0f}%) (-3)")
             reg_score -= 3
     elif report.bgp:
-        det.append("prefix not announced in BGP")
+        det.append("prefix not announced in BGP (-8)")
         reg_score -= 8
 
     # Prefix in WHOIS?  (only penalize when we actually confirmed it's missing)
@@ -1035,6 +1077,23 @@ def compute_score(report: Report) -> int:
     if has_bad_kw:
         geo_score -= 5
         warn.append("AS name contains proxy/VPN indicator (-5)")
+
+    # Source country vs IP geo — large mismatch signals suspicious routing
+    if src_cc and geo_ip_cc and src_cc != geo_ip_cc:
+        src_continent = country_to_continent(src_cc)
+        geo_continent = country_to_continent(geo_ip_cc)
+        if src_continent and geo_continent and src_continent != geo_continent:
+            geo_score -= 7
+            warn.append(
+                f"IP in {geo_ip_cc} ({geo_continent}) vs source {src_cc}"
+                f" ({src_continent}) — different continent (-7)"
+            )
+        else:
+            geo_score -= 3
+            det.append(
+                f"IP in {geo_ip_cc} differs from source {src_cc}"
+                f" — cross-country routing (-3)"
+            )
 
     geo_score = max(0, min(geo_score, 30))
     det.append(f"Geo-Registration Consistency: {geo_score}/25")
@@ -1140,8 +1199,9 @@ def compute_score(report: Report) -> int:
 
         # Unexpected country hops
         if trace.unexpected_countries:
-            trace_score -= len(trace.unexpected_countries) * 3
-            warn.append(f"unexpected country hops: {', '.join(trace.unexpected_countries)}")
+            penalty = len(trace.unexpected_countries) * 3
+            trace_score -= penalty
+            warn.append(f"unexpected country hops: {', '.join(trace.unexpected_countries)} (-{penalty})")
     else:
         trace_score = 8
         det.append("traceroute: not available — 8/15 (use --traceroute via Globalping)")
@@ -1165,7 +1225,7 @@ def compute_score(report: Report) -> int:
             warn.append("GreyNoise classifies IP as malicious (-12)")
         elif gn_class == "noise":
             threat_score -= 3
-            det.append("GreyNoise: background internet scanner — low concern")
+            det.append("GreyNoise: background internet scanner — low concern (-3)")
         elif gn_class == "benign":
             threat_score += 5
             pos.append("GreyNoise: known benign (+5)")
@@ -1187,7 +1247,7 @@ def compute_score(report: Report) -> int:
             warn.append(f"AbuseIPDB moderate confidence ({abuse_score}%) (-8)")
         elif abuse_score >= 20:
             threat_score -= 4
-            det.append(f"AbuseIPDB low confidence ({abuse_score}%) — minor concern")
+            det.append(f"AbuseIPDB low confidence ({abuse_score}%) — minor concern (-4)")
     else:
         if "AbuseIPDB" in report.api_keys:
             det.append("AbuseIPDB: no reports (API key OK) — no threat data")
@@ -1206,6 +1266,7 @@ def compute_score(report: Report) -> int:
             warn.append(f"OTX: {otx} threat pulses — moderate (-4)")
         elif otx >= 1:
             threat_score -= 2
+            det.append(f"OTX: {otx} threat pulses — low (-2)")
     else:
         if "OTX" in report.api_keys:
             det.append("OTX: no threat pulses (API key OK) — clean")
@@ -1214,8 +1275,9 @@ def compute_score(report: Report) -> int:
 
     # OTX malware associations
     if threat.otx_malware:
-        threat_score -= min(len(threat.otx_malware) * 2, 6)
-        warn.append(f"OTX malware associations: {', '.join(threat.otx_malware)}")
+        penalty = min(len(threat.otx_malware) * 2, 6)
+        threat_score -= penalty
+        warn.append(f"OTX malware associations: {', '.join(threat.otx_malware)} (-{penalty})")
 
     threat_score = max(0, threat_score)
     det.append(f"Threat Intelligence: {threat_score}/20")
