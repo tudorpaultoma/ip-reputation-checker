@@ -12,12 +12,18 @@ firewall checking whether traffic originating from your region actually belongs 
 
 Usage:
     python3 ip_reputation.py 8.8.8.8
-    python3 ip_reputation.py 185.220.101.1 --no-traceroute
+    python3 ip_reputation.py 185.220.101.1
     python3 ip_reputation.py 45.33.32.156 --source-country DE
     python3 ip_reputation.py 8.8.8.8 --json result.json
-    python3 ip_reputation.py 8.8.8.8 --abuseipdb-key KEY --ipinfo-key TOKEN
 
-Free (no key):  Team Cymru, RIPEstat, ip-api, GreyNoise, whois, DNS, traceroute
+API keys can be passed via CLI flags, environment variables, or a .env file.
+Copy .env.example to .env and fill in your keys:
+
+    cp .env.example .env
+    # Edit .env with your keys, then:
+    python3 ip_reputation.py 8.8.8.8
+
+Free (no key):  Team Cymru, RIPEstat, ip-api, GreyNoise, whois, DNS, Globalping traceroute
 Free API key:  AbuseIPDB, ipinfo.io, AlienVault OTX, MaxMind GeoLite2
 """
 
@@ -48,6 +54,74 @@ try:
 except ImportError:
     HAS_REQUESTS = False
     _SESSION = None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# .env file loader — no python-dotenv dependency needed
+# ---------------------------------------------------------------------------
+def _load_dotenv(path: str | None = None) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ.
+
+    Search order (first match wins, does NOT overwrite existing env vars):
+
+    1. Explicit *path* (if given)
+    2. Script directory + ``.env``  (where the script lives — most predictable)
+    3. Parent of script directory + ``.env``  (project/.env + project/src/script.py)
+    4. Walk up from ``cwd`` to the filesystem root looking for ``.env``
+       (like ``git`` does — finds ``.env`` in any ancestor of where you ran from)
+
+    This means ``.env`` placed next to the script is always found, no matter
+    which directory you run from.  Cwd-ancestor ``.env`` files only act as
+    overrides when no script-local ``.env`` exists.
+    """
+    candidates: list[str] = []
+
+    # 1 — explicit path
+    if path:
+        candidates.append(path)
+
+    # 2 — script directory (priority: always find the project's own .env)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(script_dir, ".env"))
+
+    # 3 — parent of script directory (common for project/.env + project/src/script.py)
+    script_parent = os.path.dirname(script_dir)
+    if script_parent != script_dir:
+        candidates.append(os.path.join(script_parent, ".env"))
+
+    # 4 — walk up from cwd (fallback: your working directory or its ancestors)
+    cwd = os.getcwd()
+    while True:
+        candidates.append(os.path.join(cwd, ".env"))
+        parent = os.path.dirname(cwd)
+        if parent == cwd:  # reached filesystem root
+            break
+        cwd = parent
+
+    for fp in candidates:
+        if not os.path.isfile(fp):
+            continue
+        try:
+            with open(fp, "r", encoding="utf-8") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    val = val.strip()
+                    # Strip optional surrounding quotes
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                        val = val[1:-1]
+                    # Only set if not already in the environment
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+            return  # first match wins
+        except OSError:
+            continue
+
 
 # ---------------------------------------------------------------------------
 # constants
@@ -128,13 +202,15 @@ def _whois_raw(query: str, server: str = "whois.cymru.com", port: int = 43) -> s
         return ""
 
 
-def _run(cmd: list[str], timeout: int = 15) -> str:
-    """Run a subprocess, return stdout or ''."""
+def _run(cmd: list[str], timeout: int = 15) -> tuple[str, str]:
+    """Run a subprocess, return (stdout, stderr).  Both empty on failure."""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout or r.stderr or ""
-    except Exception:
-        return ""
+        return (r.stdout or "", r.stderr or "")
+    except FileNotFoundError:
+        return ("", f"command not found: {cmd[0]}")
+    except Exception as e:
+        return ("", str(e))
 
 
 def _resolve_ptr(ip: str) -> str:
@@ -306,6 +382,7 @@ class Report:
     threat: ThreatResult = field(default_factory=ThreatResult)
 
     whois_raw: str = ""
+    api_keys: set[str] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +572,8 @@ def lookup_dns(ip: str) -> DnsInfo:
 # 5 — system whois  (built-in)
 # ---------------------------------------------------------------------------
 def lookup_whois(ip: str) -> str:
-    return _run(["whois", ip], timeout=12)
+    stdout, _ = _run(["whois", ip], timeout=12)
+    return stdout
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +587,8 @@ def lookup_greynoise(ip: str) -> dict:
         r = _SESSION.get(f"https://api.greynoise.io/v3/community/{ip}", timeout=10)
         if r.status_code == 404:
             return {"classification": "unknown", "message": "no-scan-data"}
+        if r.status_code == 429:
+            return {"rate_limited": True, "classification": None}
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -518,9 +598,10 @@ def lookup_greynoise(ip: str) -> dict:
 # ---------------------------------------------------------------------------
 # 7 — AbuseIPDB  (free key: 1000/day)
 # ---------------------------------------------------------------------------
-def lookup_abuseipdb(ip: str, key: str) -> dict:
+def lookup_abuseipdb(ip: str, key: str) -> dict | None:
+    """Returns data dict on success, empty dict on 4xx, None on network error."""
     if not HAS_REQUESTS or not key:
-        return {}
+        return None
     try:
         r = _SESSION.get(
             "https://api.abuseipdb.com/api/v2/check",
@@ -528,11 +609,13 @@ def lookup_abuseipdb(ip: str, key: str) -> dict:
             headers={"Key": key, "Accept": "application/json"},
             timeout=10,
         )
+        if r.status_code == 401 or r.status_code == 403:
+            return {}  # bad key — distinguishable from network failure
         r.raise_for_status()
         data = r.json().get("data", {})
         return data
     except Exception:
-        return {}
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -563,61 +646,156 @@ def lookup_otx(ip: str, key: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 10 — traceroute  (system)
+# 10 — traceroute via Globalping  (free, no key, 500 tests/hour)
 # ---------------------------------------------------------------------------
-def run_traceroute(ip: str, max_hops: int = 30) -> TracerouteData:
-    """Run system traceroute and parse results."""
-    # macOS: traceroute -n -m N -q 1 IP
-    # Linux: traceroute -n -m N -q 1 IP
-    cmd = ["traceroute", "-n", "-m", str(max_hops), "-q", "1", ip]
-    raw = _run(cmd, timeout=60)
-    if not raw:
-        return TracerouteData(raw_output="traceroute failed or timed out")
+def run_traceroute_globalping(ip: str, source_country: str = "",
+                              max_hops: int = 30) -> TracerouteData:
+    """Run traceroute via Globalping's distributed probe network.
 
-    lines = raw.strip().split("\n")
-    hops_data: list[dict] = []
+    If *source_country* is given (e.g. ``"DE"``), the measurement originates
+    from a probe in that country — realistic routing from the user's location.
+    Without it, a random global probe is used.
 
-    for line in lines[1:]:
-        match = re.match(r"\s*(\d+)\s+(.+)", line)
-        if not match:
+    Globalping is free (500 tests/hour authenticated, less unauthenticated).
+    No API key required.  No root / sudo needed.
+    """
+    if not HAS_REQUESTS:
+        return TracerouteData(raw_output="requests not installed — traceroute unavailable")
+
+    # ------------------------------------------------------------------
+    # Step 1 — Build location filter from source country
+    # ------------------------------------------------------------------
+    locations: list[dict] = []
+    if source_country:
+        cc = country_name_to_code(source_country)
+        if len(cc) == 2:
+            locations = [{"country": cc}]
+
+    # ------------------------------------------------------------------
+    # Step 2 — POST /v1/measurements to create the measurement
+    # ------------------------------------------------------------------
+    payload: dict = {
+        "type": "traceroute",
+        "target": ip,
+        "limit": 1,
+        "measurementOptions": {
+            "protocol": "ICMP",
+            "port": 80,  # TCP/80 — less likely filtered than ICMP
+        },
+    }
+    if locations:
+        payload["locations"] = locations
+
+    try:
+        r = _SESSION.post(
+            "https://api.globalping.io/v1/measurements",
+            json=payload,
+            timeout=15,
+        )
+        if r.status_code == 422:
+            loc_desc = source_country or "worldwide"
+            return TracerouteData(
+                raw_output=f"Globalping: no probes available in {loc_desc}"
+            )
+        if r.status_code == 429:
+            return TracerouteData(
+                raw_output="Globalping: rate limited — try again later"
+            )
+        r.raise_for_status()
+        data = r.json()
+        measurement_id = data.get("id", "")
+        if not measurement_id:
+            return TracerouteData(raw_output="Globalping: no measurement ID returned")
+    except Exception as exc:
+        return TracerouteData(raw_output=f"Globalping: create failed ({exc})")
+
+    # ------------------------------------------------------------------
+    # Step 3 — Poll GET /v1/measurements/{id} until finished
+    # ------------------------------------------------------------------
+    result_url = f"https://api.globalping.io/v1/measurements/{measurement_id}"
+    data = {}
+    for _attempt in range(20):  # max ~40 s
+        time.sleep(2)
+        try:
+            r = _SESSION.get(result_url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            status = data.get("status", "")
+            if status == "finished":
+                break
+        except Exception:
             continue
-        hop_num = int(match.group(1))
-        rest = match.group(2)
+    else:
+        return TracerouteData(raw_output="Globalping: measurement timed out")
 
-        # Check for * * * (timeout)
-        if rest.strip().startswith("*"):
-            hops_data.append({"hop": hop_num, "ip": None, "latency": None})
-            continue
+    # ------------------------------------------------------------------
+    # Step 4 — Parse results
+    # ------------------------------------------------------------------
+    results = data.get("results", [])
+    if not results:
+        return TracerouteData(raw_output="Globalping: no probe results")
 
-        # Parse latency from e.g. "8.8.8.8  12.345 ms"
-        latency_match = re.search(r"([\d.]+)\s*ms", rest)
-        ip_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", rest)
-        latency = float(latency_match.group(1)) if latency_match else None
-        hop_ip = ip_match.group(1) if ip_match else None
-        hops_data.append({"hop": hop_num, "ip": hop_ip, "latency": latency})
+    result_entry = results[0]
+    probe = result_entry.get("probe", {})
+    trace_result = result_entry.get("result", {})
+    raw_output = trace_result.get("rawOutput", "")
+    structured_hops: list[dict] = trace_result.get("hops", [])
 
-    # Count actual hops (not timeouts)
-    real_hops = [h for h in hops_data if h["ip"] is not None]
-    latencies = [h["latency"] for h in real_hops if h["latency"] is not None]
+    probe_country = probe.get("country", "")
+    probe_city = probe.get("city", "")
+    probe_location = f"{probe_city}, {probe_country}" if probe_city else probe_country
 
-    # Detect loops: same IP appearing more than once (excluding consecutive duplicates)
-    seen_ips: dict[str, list[int]] = {}
-    for h in real_hops:
-        ip_val = h["ip"]
-        if ip_val not in seen_ips:
-            seen_ips[ip_val] = []
-        seen_ips[ip_val].append(h["hop"])
-    has_loop = any(len(hops_list) > 1 and (hops_list[-1] - hops_list[0] > 1)
-                   for hops_list in seen_ips.values())
+    # Parse structured hops (only reachable hops)
+    parsed_hops: list[dict] = []
+    for idx, hop in enumerate(structured_hops):
+        hop_ip = (hop.get("resolvedAddress") or hop.get("resolvedHostname") or "")
+        hostname = hop.get("resolvedHostname", "")
+        timings = hop.get("timings", [])
+        if timings:
+            rtt_vals = [t.get("rtt", 0) for t in timings if t.get("rtt")]
+            latency = sum(rtt_vals) / len(rtt_vals) if rtt_vals else None
+        else:
+            latency = None
+        parsed_hops.append({
+            "hop": idx + 1,
+            "ip": hop_ip,
+            "hostname": hostname,
+            "latency": latency,
+        })
+
+    # Count total attempted hops from rawOutput (includes timeouts)
+    total_hop_lines = 0
+    for line in raw_output.split("\n"):
+        if re.match(r"^\s*\d+", line):
+            total_hop_lines += 1
+    if total_hop_lines == 0:
+        total_hop_lines = len(parsed_hops)  # fallback
+
+    reachable = len(parsed_hops)
+    latencies = [h["latency"] for h in parsed_hops if h["latency"] is not None]
+
+    # Detect routing loops (same IP re-appearing non-consecutively)
+    ips_in_order = [h["ip"] for h in parsed_hops if h["ip"]]
+    has_loop = False
+    if ips_in_order:
+        seen: dict[str, int] = {}
+        for pos, ip_val in enumerate(ips_in_order):
+            if ip_val in seen and (pos - seen[ip_val] > 1):
+                has_loop = True
+                break
+            seen[ip_val] = pos
 
     return TracerouteData(
-        hops=len(real_hops),
+        hops=reachable,
         avg_latency_ms=sum(latencies) / len(latencies) if latencies else 0.0,
-        loss_pct=round((1 - len(real_hops) / len(hops_data)) * 100, 1) if hops_data else 0.0,
+        loss_pct=round((1 - reachable / total_hop_lines) * 100, 1)
+        if total_hop_lines else 0.0,
         countries=[],
         has_loop=has_loop,
         unexpected_countries=[],
-        raw_output=raw,
+        raw_output=f"Globalping → {ip}"
+                    f" from {probe_location} ({probe.get('network', '')})\n"
+                    f"{raw_output}",
     )
 
 
@@ -966,7 +1144,7 @@ def compute_score(report: Report) -> int:
             warn.append(f"unexpected country hops: {', '.join(trace.unexpected_countries)}")
     else:
         trace_score = 8
-        det.append("traceroute: not available — 8/15 (run with sudo to enable)")
+        det.append("traceroute: not available — 8/15 (use --traceroute via Globalping)")
 
     trace_score = max(0, trace_score)
     det.append(f"Traceroute Quality: {trace_score}/15")
@@ -1011,7 +1189,10 @@ def compute_score(report: Report) -> int:
             threat_score -= 4
             det.append(f"AbuseIPDB low confidence ({abuse_score}%) — minor concern")
     else:
-        det.append("AbuseIPDB: no reports (or API key not provided) — no threat data")
+        if "AbuseIPDB" in report.api_keys:
+            det.append("AbuseIPDB: no reports (API key OK) — no threat data")
+        else:
+            det.append("AbuseIPDB: no data (API key not provided)")
 
     # OTX pulses
     otx = threat.otx_pulses
@@ -1026,7 +1207,10 @@ def compute_score(report: Report) -> int:
         elif otx >= 1:
             threat_score -= 2
     else:
-        det.append("OTX: no threat pulses (or API key not provided)")
+        if "OTX" in report.api_keys:
+            det.append("OTX: no threat pulses (API key OK) — clean")
+        else:
+            det.append("OTX: no data (API key not provided)")
 
     # OTX malware associations
     if threat.otx_malware:
@@ -1087,6 +1271,9 @@ def grade_color(grade: str) -> str:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
+    # Load .env file BEFORE argparse — env vars feed argparse defaults
+    _load_dotenv()
+
     parser = argparse.ArgumentParser(
         description="IP Reputation Engine — firewall-aligned scoring",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1094,16 +1281,20 @@ def main() -> None:
 examples:
   python3 ip_reputation.py 8.8.8.8
   python3 ip_reputation.py 45.33.32.156 --source-country DE
-  python3 ip_reputation.py 185.220.101.1 --no-traceroute --json report.json
-  python3 ip_reputation.py 8.8.8.8 --abuseipdb-key KEY --ipinfo-key TOKEN
+  python3 ip_reputation.py 185.220.101.1 --json report.json
+
+API keys can be stored in a .env file (copy .env.example → .env and edit).
+CLI flags and real env vars override .env values.
         """,
     )
     parser.add_argument("ip", help="target IPv4 address")
     parser.add_argument("--source-country", "-s",
                         help="your country (e.g. DE, Germany). Enables source-location consistency check. "
                              "Also settable via SOURCE_COUNTRY env var.")
+    parser.add_argument("--traceroute", action="store_true",
+                        help="enable traceroute via Globalping (free, no root required)")
     parser.add_argument("--no-traceroute", action="store_true",
-                        help="skip traceroute (no sudo needed)")
+                        help=argparse.SUPPRESS)  # deprecated — kept for backwards compat
     parser.add_argument("--json", metavar="FILE",
                         help="export full report as JSON to FILE")
     parser.add_argument("--abuseipdb-key",
@@ -1132,10 +1323,20 @@ examples:
     # Source country: CLI overrides env var
     source_country = args.source_country or os.environ.get("SOURCE_COUNTRY", "")
 
+    # Track which API keys the user provided (for smarter scoring messages)
+    api_keys = set()
+    if args.abuseipdb_key:
+        api_keys.add("AbuseIPDB")
+    if args.otx_key:
+        api_keys.add("OTX")
+    if args.ipinfo_key:
+        api_keys.add("ipinfo")
+
     report = Report(
         ip=ip,
         timestamp=datetime.now(timezone.utc).isoformat(),
         source_country=source_country,
+        api_keys=api_keys,
     )
 
     sources_used: list[str] = []
@@ -1261,7 +1462,10 @@ examples:
     # 6. GreyNoise
     print("  [6/8] GreyNoise Community — classification ...", end=" ", flush=True)
     gn = lookup_greynoise(ip)
-    if gn.get("message") == "Success" or gn.get("classification"):
+    if gn.get("rate_limited"):
+        report.threat.greynoise_class = None
+        print("rate limited (25 req/week free tier)")
+    elif gn.get("message") == "Success" or gn.get("classification"):
         report.threat.greynoise_class = gn.get("classification", "unknown")
         report.threat.greynoise_riot = gn.get("riot", False)
         sources_used.append("GreyNoise")
@@ -1272,13 +1476,13 @@ examples:
         sources_used.append("GreyNoise")
         print("OK (no scan data)")
     else:
-        print("FAIL")
+        print("unavailable (network) — score unaffected")
 
     # 7. AbuseIPDB (optional key)
     if args.abuseipdb_key:
         print("  [7/8] AbuseIPDB — abuse confidence ...", end=" ", flush=True)
         ab = lookup_abuseipdb(ip, args.abuseipdb_key)
-        if ab:
+        if ab is not None and ab:
             report.threat.abuseipdb_score = ab.get("abuseConfidenceScore", 0)
             report.threat.abuseipdb_total = ab.get("totalReports", 0)
             report.threat.abuseipdb_country = ab.get("countryCode", "")
@@ -1286,8 +1490,11 @@ examples:
             sources_used.append("AbuseIPDB")
             print(f"OK ({report.threat.abuseipdb_score}% confidence, "
                   f"{report.threat.abuseipdb_total} reports)")
+        elif ab is not None:
+            # Empty dict = auth failure (401/403)
+            print("FAIL (check API key)")
         else:
-            print("FAIL")
+            print("FAIL (network/API down)")
 
     # 8. OTX (optional key)
     if args.otx_key:
@@ -1323,20 +1530,28 @@ examples:
         else:
             print("FAIL")
 
-    # Traceroute
-    if args.no_traceroute:
-        print("  [8/8] traceroute: skipped (--no-traceroute)")
-    else:
-        print("  [8/8] traceroute — route analysis ...", end=" ", flush=True)
-        report.trace = run_traceroute(ip)
+    # Traceroute via Globalping (opt-in — no root required)
+    if args.traceroute:
+        print("  [8/8] Globalping traceroute ...", end=" ", flush=True)
+        report.trace = run_traceroute_globalping(ip, source_country=source_country)
         if report.trace.hops > 0:
-            sources_used.append("traceroute")
+            sources_used.append("Globalping traceroute")
+            loc_info = ""
+            # Extract probe location from raw_output header line
+            first_line = report.trace.raw_output.split("\n")[0] if report.trace.raw_output else ""
+            if " from " in first_line:
+                loc_info = first_line.split(" from ", 1)[1].split("\n")[0]
             print(f"OK ({report.trace.hops} hops, "
                   f"{report.trace.avg_latency_ms:.0f}ms avg, "
                   f"{report.trace.loss_pct:.0f}% loss" +
-                  (" [LOOP]" if report.trace.has_loop else ""))
+                  (" [LOOP]" if report.trace.has_loop else "") +
+                  (f", {loc_info}" if loc_info else "") +
+                  ")")
         else:
-            print("FAIL (try with sudo, or use --no-traceroute to skip)")
+            err = report.trace.raw_output or "unknown error"
+            print(f"FAIL — {err}")
+    else:
+        print("  [8/8] Globalping traceroute: skipped (enable with --traceroute)")
 
     # ------------------------------------------------------------------
     # Phase 2 — Scoring
