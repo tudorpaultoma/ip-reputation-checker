@@ -925,7 +925,9 @@ def compute_score(report: Report) -> int:
     age_source = ""
     if report.bgp and report.bgp.first_seen:
         alloc_age_for_scoring = years_since(report.bgp.first_seen)
-        age_source = f"BGP first seen {alloc_age_for_scoring}y ago"
+        # Show actual first-seen date + age for context
+        first_date = report.bgp.first_seen.split("T")[0]
+        age_source = f"BGP first seen {first_date} ({alloc_age_for_scoring}y ago, RIPEstat)"
     elif asn and asn.allocated:
         alloc_age_for_scoring = years_since(asn.allocated)
         age_source = f"RIR allocated {alloc_age_for_scoring}y ago"
