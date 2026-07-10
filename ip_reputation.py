@@ -876,8 +876,8 @@ def _score_asn_type(asn: AsnResult | None, geo: GeoResult) -> tuple[int, list[st
         pos.append("residential/ISP AS (+2)")
         return 2, pos, warn
     elif is_major_cloud:
-        pos.append("recognized cloud provider (+2)")
-        return 2, pos, warn
+        # Industry consensus: cloud/DC IPs get no bonus in reputation scoring
+        return 0, pos, warn
     elif is_hosting:
         warn.append("hosting/datacenter AS — common for VPNs/proxies (-5)")
         return -5, pos, warn
@@ -908,11 +908,10 @@ def compute_score(report: Report) -> int:
                      (asn.as_name if asn else "")).lower()
 
     # ====================================================================
-    # DIMENSION 1 — Registration & Entity (30 pts)
-    #   Start at midpoint (15). Bad signals drag down; good signals lift up.
-    #   This prevents every cloud IP from hitting the 30-point cap.
+    # DIMENSION 1 — Registration & Entity (25 pts)
+    #   Start at neutral baseline (16). Good signals lift; bad drag.
     # ====================================================================
-    reg_score = 18  # start above midpoint — earn extras, lose on bad signals
+    reg_score = 16
 
     # ASN type scoring
     type_pts, type_pos, type_warn = _score_asn_type(asn, geo)
@@ -925,22 +924,20 @@ def compute_score(report: Report) -> int:
     age_source = ""
     if report.bgp and report.bgp.first_seen:
         alloc_age_for_scoring = years_since(report.bgp.first_seen)
-        # Show actual first-seen date + age for context
         first_date = report.bgp.first_seen.split("T")[0]
         age_source = f"BGP first seen {first_date} ({alloc_age_for_scoring}y ago, RIPEstat)"
     elif asn and asn.allocated:
         alloc_age_for_scoring = years_since(asn.allocated)
         age_source = f"RIR allocated {alloc_age_for_scoring}y ago"
     elif report.whois_raw:
-        # Parse RegDate from system whois as final fallback
         m = re.search(r'RegDate:\s*(\d{4}-\d{2}-\d{2})', report.whois_raw)
         if m:
             alloc_age_for_scoring = years_since(m.group(1))
             age_source = f"whois RegDate {alloc_age_for_scoring}y ago"
 
     if alloc_age_for_scoring is not None and alloc_age_for_scoring >= 15:
-        pos.append(f"IP block established ({age_source}) (+5)")
-        reg_score += 5
+        pos.append(f"IP block established ({age_source}) (+6)")
+        reg_score += 6
     elif alloc_age_for_scoring is not None and alloc_age_for_scoring >= 8:
         pos.append(f"IP block established ({age_source}) (+3)")
         reg_score += 3
@@ -948,31 +945,32 @@ def compute_score(report: Report) -> int:
         det.append(f"IP block moderately aged ({age_source}) (-2)")
         reg_score -= 2
     elif alloc_age_for_scoring is not None and alloc_age_for_scoring <= 2:
-        reg_score -= 8
-        warn.append(f"IP block recently allocated ({age_source}) (-8)")
+        reg_score -= 3
+        det.append(f"IP block recently allocated ({age_source}) (-3)")
     else:
         det.append("allocation age unknown (-1)")
         reg_score -= 1
 
     # FCrDNS
     if dns.fcrdns_ok:
-        pos.append(f"FCrDNS confirmed: {dns.ptr} (+3)")
-        reg_score += 3
+        pos.append(f"FCrDNS confirmed: {dns.ptr} (+7)")
+        reg_score += 7
     elif dns.ptr:
-        det.append(f"reverse DNS set ({dns.ptr}) but no forward match")
+        det.append(f"reverse DNS set ({dns.ptr}) but no forward match (-2)")
+        reg_score -= 2
     else:
-        det.append("no reverse DNS (PTR) record (-3)")
-        reg_score -= 3
+        det.append("no reverse DNS (PTR) record (-5)")
+        reg_score -= 5
 
     # RPKI
     rpki = report.rpki
     if rpki:
         if rpki.status == "valid":
-            pos.append(f"RPKI valid — route origin authorized (+5)")
-            reg_score += 5
+            pos.append("RPKI valid — route origin authorized (+8)")
+            reg_score += 8
         elif rpki.status == "invalid":
-            reg_score -= 10
-            warn.append("RPKI invalid — possible route hijack (-10)")
+            reg_score -= 15
+            warn.append("RPKI invalid — possible route hijack (-15)")
         else:
             det.append("RPKI status: unknown")
     else:
@@ -980,11 +978,11 @@ def compute_score(report: Report) -> int:
 
     # Abuse contact
     if report.abuse and report.abuse.email:
-        pos.append(f"abuse contact published (+2)")
+        pos.append("abuse contact published (+2)")
         reg_score += 2
     else:
-        det.append("no published abuse contact (-2)")
-        reg_score -= 2
+        det.append("no published abuse contact (-3)")
+        reg_score -= 3
 
     # BGP visibility
     if report.bgp and report.bgp.announced:
@@ -1008,157 +1006,128 @@ def compute_score(report: Report) -> int:
         warn.append("BGP prefix missing from WHOIS registration (-5)")
         reg_score -= 5
 
-    # PTR hostname intelligence — detect Tor/VPN/proxy from reverse DNS
-    ptr_lower = dns.ptr.lower() if dns.ptr else ""
-    ptr_suspicious = any(kw in ptr_lower for kw in [
-        "tor-exit", "tor-relay", "tor-node", "torexit", "tor-proxy",
-        "vpn-gateway", "vpn-server", "vpn-node", "proxy-exit", "proxy-node",
-        "anonymous-proxy", "anon-proxy",
-    ])
-    if ptr_suspicious:
-        warn.append(f"PTR hostname indicates anonymizing service: {dns.ptr} (-10)")
-        reg_score -= 10
-
-    reg_score = max(0, min(reg_score, 30))
-    det.append(f"Registration & Entity: {reg_score}/30")
+    reg_score = max(0, min(reg_score, 25))
+    det.append(f"Registration & Entity: {reg_score}/25")
     report.breakdown["registration_entity"] = reg_score
 
     # ====================================================================
-    # DIMENSION 2 — Geo-Registration Consistency (25 pts)
+    # DIMENSION 2 — Geo & Source Consistency (15 pts)
+    #   IP geo vs BGP registration + source country checks.
+    #   Privacy/tor/proxy flags moved to D3 (Anonymization).
     # ====================================================================
-    geo_score = 18
+    geo_score = 10  # neutral baseline, earn up to 15, can go to 0
     geo_ip_cc = geo.country_code.upper()
     geo_bgp_cc = (asn.cc or "").upper() if asn else ""
 
     # IP geo vs BGP registration country
     if geo_bgp_cc and geo_ip_cc:
         if geo_ip_cc == geo_bgp_cc:
-            pos.append(f"geo country ({geo_ip_cc}) matches BGP registration ({geo_bgp_cc}) (+7)")
-            geo_score += 7
+            pos.append(f"geo country ({geo_ip_cc}) matches BGP registration ({geo_bgp_cc}) (+5)")
+            geo_score += 5
         else:
-            geo_score -= 10
-            warn.append(f"geo ({geo_ip_cc}) differs from BGP registration ({geo_bgp_cc}) — possible VPN/proxy/hosting (-10)")
+            geo_score -= 8
+            warn.append(f"geo ({geo_ip_cc}) differs from BGP registration ({geo_bgp_cc}) — possible VPN/proxy/hosting (-8)")
 
     # IP in high-risk country?
     if geo_ip_cc in HIGH_RISK_COUNTRIES:
         geo_score -= 8
         warn.append(f"IP in high-risk/sanctioned country ({geo_ip_cc}) (-8)")
 
-    # Proxy / VPN / hosting flags
-    flags = []
-    if geo.is_proxy:
-        flags.append("proxy")
-    if geo.is_hosting:
-        flags.append("hosting/public-cloud")
-    # PTR-based anonymizer detection
-    ptr_lower_geo = dns.ptr.lower() if dns.ptr else ""
-    if any(kw in ptr_lower_geo for kw in ["tor-exit", "tor-relay", "tor-node",
-                                             "torexit", "tor-proxy", "vpn-gateway",
-                                             "vpn-server", "vpn-node", "proxy-exit",
-                                             "proxy-node", "anonymous-proxy"]):
-        if "tor-exit" not in flags:
-            flags.append("tor-exit (PTR)")
-    if threat.greynoise_riot:
-        flags.clear()
-        pos.append("GreyNoise RIOT: known benign service")
-    if flags:
-        # Calculate penalty: tor-exit/vpn flags are more severe
-        penalty = 0
-        for f in flags:
-            if "tor-exit" in f:
-                penalty += 10
-            elif "proxy" in f:
-                penalty += 8
-            else:
-                penalty += 3
-        geo_score -= penalty
-        warn.append(f"privacy flags: {'/'.join(flags)} (-{penalty})")
-
-    # AS organization keywords check
-    has_bad_kw = any(kw in asn_org_lower for kw in ["proxy", "anonymous", "vpn"])
-    if has_bad_kw:
-        geo_score -= 5
-        warn.append("AS name contains proxy/VPN indicator (-5)")
-
     # Source country vs IP geo — large mismatch signals suspicious routing
     if src_cc and geo_ip_cc and src_cc != geo_ip_cc:
         src_continent = country_to_continent(src_cc)
         geo_continent = country_to_continent(geo_ip_cc)
         if src_continent and geo_continent and src_continent != geo_continent:
-            geo_score -= 7
-            warn.append(
-                f"IP in {geo_ip_cc} ({geo_continent}) vs source {src_cc}"
-                f" ({src_continent}) — different continent (-7)"
-            )
-        else:
             geo_score -= 3
             det.append(
+                f"IP in {geo_ip_cc} ({geo_continent}) vs source {src_cc}"
+                f" ({src_continent}) — different continent (-3)"
+            )
+        else:
+            geo_score -= 2
+            det.append(
                 f"IP in {geo_ip_cc} differs from source {src_cc}"
-                f" — cross-country routing (-3)"
+                f" — cross-country routing (-2)"
             )
 
-    geo_score = max(0, min(geo_score, 30))
-    det.append(f"Geo-Registration Consistency: {geo_score}/25")
+    # Source-location consistency (merged from old D3)
+    if src_cc:
+        src_cc_normalized = country_name_to_code(src_cc)
+        det.append(f"source location: {src_cc_normalized}")
+
+        src_matches_geo = (src_cc_normalized == geo_ip_cc) if geo_ip_cc else None
+        src_matches_bgp = (src_cc_normalized == geo_bgp_cc) if geo_bgp_cc else None
+
+        # Source in high-risk country?
+        if src_cc_normalized in HIGH_RISK_COUNTRIES:
+            det.append(f"note: source country ({src_cc_normalized}) is on high-risk list")
+    else:
+        det.append("source location: not provided (use --source-country to enable)")
+
+    geo_score = max(0, min(geo_score, 15))
+    det.append(f"Geo & Source Consistency: {geo_score}/15")
     report.breakdown["geo_match"] = geo_score
 
     # ====================================================================
-    # DIMENSION 3 — Source-Location Consistency (10 pts)
-    #   Staged penalties: a CDN/server in a neighbouring country is normal;
-    #   an IP registered on a different continent from the user is not.
+    # DIMENSION 3 — Anonymization & Privacy (15 pts)
+    #   TOR, proxy, VPN, hosting flags. Start clean (15), deductions only.
+    #   Industry treats anonymization as the #2 signal after threat intel.
     # ====================================================================
-    src_score = 10
+    anon_score = 15
 
-    if src_cc:
-        src_cc = country_name_to_code(src_cc)
-        det.append(f"source location: {src_cc}")
+    # Collect privacy flags from multiple sources
+    anon_flags: list[str] = []
 
-        src_matches_geo = (src_cc == geo_ip_cc) if geo_ip_cc else None
-        src_matches_bgp = (src_cc == geo_bgp_cc) if geo_bgp_cc else None
+    # ip-api privacy flags
+    if geo.is_proxy:
+        anon_flags.append("proxy")
+    if geo.is_hosting:
+        anon_flags.append("hosting/public-cloud")
 
-        # Three-way: source, IP location, and BGP registration ALL differ
-        three_way = (
-            geo_ip_cc and geo_bgp_cc
-            and src_cc != geo_ip_cc
-            and src_cc != geo_bgp_cc
-            and geo_ip_cc != geo_bgp_cc  # geo and BGP must also disagree
-        )
+    # PTR hostname intelligence — strongest anonymization signal
+    ptr_lower = dns.ptr.lower() if dns.ptr else ""
+    tor_ptr_keywords = ["tor-exit", "tor-relay", "tor-node", "torexit", "tor-proxy"]
+    vpn_ptr_keywords = ["vpn-gateway", "vpn-server", "vpn-node",
+                        "proxy-exit", "proxy-node", "anonymous-proxy", "anon-proxy"]
+    if any(kw in ptr_lower for kw in tor_ptr_keywords):
+        if "tor-exit" not in anon_flags:
+            anon_flags.append("tor-exit (PTR)")
+    if any(kw in ptr_lower for kw in vpn_ptr_keywords):
+        if "vpn/proxy" not in anon_flags and "proxy" not in anon_flags:
+            anon_flags.append("vpn/proxy (PTR)")
 
-        if src_matches_geo and src_matches_bgp:
-            # Perfect: everything lines up
-            pos.append(f"source ({src_cc}) consistent with IP location and BGP registration")
-        elif src_matches_geo and src_matches_bgp is False:
-            # IP geolocated near user but ASN registered elsewhere — mild
-            src_score -= 3
-            det.append(f"source ({src_cc}) matches IP location but not BGP registration ({geo_bgp_cc}) (-3)")
-        elif src_matches_geo is False and src_matches_bgp:
-            # ASN registered near user but IP geolocated elsewhere — mild
-            src_score -= 3
-            det.append(f"source ({src_cc}) matches BGP but IP geolocated in {geo_ip_cc} (-3)")
-        elif three_way:
-            # All three disagree — strongest signal
-            src_score -= 7
-            warn.append(f"three-way mismatch: source ({src_cc}) vs IP location ({geo_ip_cc}) vs BGP ({geo_bgp_cc}) (-7)")
-        elif src_matches_geo is False and src_matches_bgp is False:
-            # Source doesn't match either geo or BGP, but geo=BGP — CDN scenario
-            src_score -= 7
-            det.append(f"CDN/hosting: IP ({geo_ip_cc}) consistent with BGP but differs from source ({src_cc}) (-7)")
+    # AS organization name contains proxy/VPN keywords
+    has_bad_kw = any(kw in asn_org_lower for kw in ["proxy", "anonymous", "vpn"])
+    if has_bad_kw:
+        anon_flags.append("proxy/VPN AS")
 
-        # Source in high-risk country? (unusual but worth noting)
-        if src_cc in HIGH_RISK_COUNTRIES:
-            det.append(f"note: source country ({src_cc}) is on high-risk list")
-    else:
-        src_score = 0
-        det.append("Source-Location: not provided (use --source-country to enable)")
+    # GreyNoise RIOT override — known benign services clear all flags
+    if threat.greynoise_riot:
+        anon_flags.clear()
+        pos.append("GreyNoise RIOT: known benign service — anonymization flags overridden")
 
-    src_score = max(-10, src_score)
-    det.append(f"Source-Location Consistency: {src_score}/10")
-    report.breakdown["source_consistency"] = src_score
+    if anon_flags:
+        penalty = 0
+        for f in anon_flags:
+            if "tor-exit" in f:
+                penalty += 15
+            elif "proxy" in f or "vpn" in f:
+                penalty += 10
+            else:
+                penalty += 5
+        anon_score -= penalty
+        warn.append(f"anonymization flags: {'; '.join(anon_flags)} (-{penalty})")
+
+    anon_score = max(0, anon_score)
+    det.append(f"Anonymization & Privacy: {anon_score}/15")
+    report.breakdown["anonymization"] = anon_score
 
     # ====================================================================
-    # DIMENSION 4 — Traceroute Quality (15 pts)
-    #   No traceroute data → 0 points. No data is not a perfect score.
+    # DIMENSION 4 — Traceroute Quality (5 pts)
+    #   Minimal weight — routing health is a diagnostic, not a trust signal.
+    #   No traceroute → neutral baseline (5/5), no penalty for skipping.
     # ====================================================================
-    trace_score = 15
+    trace_score = 5
 
     if trace.hops > 0:
         # Hop count
@@ -1167,11 +1136,10 @@ def compute_score(report: Report) -> int:
         elif trace.hops <= 15:
             det.append(f"hop count: {trace.hops} — normal")
         elif trace.hops <= 20:
-            trace_score -= 2
-            det.append(f"hop count: {trace.hops} — above average (-2)")
+            det.append(f"hop count: {trace.hops} — above average")
         else:
-            trace_score -= 5
-            det.append(f"hop count: {trace.hops} — high (-5)")
+            trace_score -= 1
+            det.append(f"hop count: {trace.hops} — high (-1)")
 
         # Latency
         if trace.avg_latency_ms > 0:
@@ -1180,60 +1148,59 @@ def compute_score(report: Report) -> int:
             elif trace.avg_latency_ms <= 80:
                 det.append(f"avg latency: {trace.avg_latency_ms:.0f}ms — normal")
             elif trace.avg_latency_ms <= 150:
-                trace_score -= 3
-                det.append(f"avg latency: {trace.avg_latency_ms:.0f}ms — elevated (-3)")
+                det.append(f"avg latency: {trace.avg_latency_ms:.0f}ms — elevated")
             else:
-                trace_score -= 5
-                det.append(f"avg latency: {trace.avg_latency_ms:.0f}ms — very high (-5)")
+                trace_score -= 1
+                det.append(f"avg latency: {trace.avg_latency_ms:.0f}ms — very high (-1)")
 
         # Packet loss
         if trace.loss_pct > 10:
-            trace_score -= 5
-            det.append(f"packet loss: {trace.loss_pct:.0f}% — high (-5)")
+            trace_score -= 2
+            det.append(f"packet loss: {trace.loss_pct:.0f}% — high (-2)")
         elif trace.loss_pct > 5:
-            trace_score -= 3
-            det.append(f"packet loss: {trace.loss_pct:.0f}% — elevated (-3)")
+            trace_score -= 1
+            det.append(f"packet loss: {trace.loss_pct:.0f}% — elevated (-1)")
 
         # Routing loops
         if trace.has_loop:
-            trace_score -= 5
-            warn.append("routing loop detected in traceroute (-5)")
+            trace_score -= 2
+            warn.append("routing loop detected in traceroute (-2)")
 
         # Unexpected country hops
         if trace.unexpected_countries:
-            penalty = len(trace.unexpected_countries) * 3
+            penalty = len(trace.unexpected_countries)
             trace_score -= penalty
             warn.append(f"unexpected country hops: {', '.join(trace.unexpected_countries)} (-{penalty})")
     else:
-        trace_score = 8
-        det.append("traceroute: not available — 8/15 (use --traceroute via Globalping)")
+        det.append("traceroute: not available — 5/5 (use --traceroute via Globalping)")
 
     trace_score = max(0, trace_score)
-    det.append(f"Traceroute Quality: {trace_score}/15")
+    det.append(f"Traceroute Quality: {trace_score}/5")
     report.breakdown["traceroute"] = trace_score
 
     # ====================================================================
-    # DIMENSION 5 — Threat Intelligence (20 pts)
-    #   Without API keys: neutral midpoint (7/20). No reports ≠ clean.
+    # DIMENSION 5 — Threat Intelligence (40 pts)
+    #   Industry consensus: #1 signal. Expanded from 20 to 40 pts.
+    #   Baseline 15 — earn positives on clean, penalize hard on hits.
     # ====================================================================
-    threat_score = 11  # slightly conservative neutral — real threat hits penalise hard
+    threat_score = 20
 
     # GreyNoise
     gn_class = threat.greynoise_class
     if gn_class:
         det.append(f"GreyNoise: {gn_class} (RIOT={threat.greynoise_riot})")
         if gn_class == "malicious":
-            threat_score -= 12
-            warn.append("GreyNoise classifies IP as malicious (-12)")
+            threat_score -= 15
+            warn.append("GreyNoise classifies IP as malicious (-15)")
         elif gn_class == "noise":
-            threat_score -= 3
-            det.append("GreyNoise: background internet scanner — low concern (-3)")
+            threat_score -= 5
+            det.append("GreyNoise: background internet scanner — low concern (-5)")
         elif gn_class == "benign":
-            threat_score += 5
-            pos.append("GreyNoise: known benign (+5)")
+            threat_score += 8
+            pos.append("GreyNoise: known benign (+8)")
         else:  # "unknown" — no scan data, typical for clean IPs
-            threat_score += 3
-            pos.append("GreyNoise: no scan data — typical for clean IPs (+3)")
+            threat_score += 5
+            pos.append("GreyNoise: no scan data — typical for clean IPs (+5)")
     else:
         det.append("GreyNoise: no data")
 
@@ -1242,14 +1209,14 @@ def compute_score(report: Report) -> int:
     if abuse_score > 0:
         det.append(f"AbuseIPDB: {abuse_score}% confidence ({threat.abuseipdb_total} reports)")
         if abuse_score >= 80:
-            threat_score -= 15
-            warn.append(f"AbuseIPDB high confidence ({abuse_score}%) — likely malicious (-15)")
+            threat_score -= 20
+            warn.append(f"AbuseIPDB high confidence ({abuse_score}%) — likely malicious (-20)")
         elif abuse_score >= 50:
-            threat_score -= 8
-            warn.append(f"AbuseIPDB moderate confidence ({abuse_score}%) (-8)")
+            threat_score -= 12
+            warn.append(f"AbuseIPDB moderate confidence ({abuse_score}%) (-12)")
         elif abuse_score >= 20:
-            threat_score -= 4
-            det.append(f"AbuseIPDB low confidence ({abuse_score}%) — minor concern (-4)")
+            threat_score -= 6
+            det.append(f"AbuseIPDB low confidence ({abuse_score}%) — minor concern (-6)")
     else:
         if "AbuseIPDB" in report.api_keys:
             det.append("AbuseIPDB: no reports (API key OK) — no threat data")
@@ -1261,14 +1228,14 @@ def compute_score(report: Report) -> int:
     if otx > 0:
         det.append(f"OTX: {otx} threat pulses")
         if otx >= 10:
-            threat_score -= 8
-            warn.append(f"OTX: {otx} threat pulses — high (-8)")
+            threat_score -= 12
+            warn.append(f"OTX: {otx} threat pulses — high (-12)")
         elif otx >= 5:
-            threat_score -= 4
-            warn.append(f"OTX: {otx} threat pulses — moderate (-4)")
+            threat_score -= 6
+            warn.append(f"OTX: {otx} threat pulses — moderate (-6)")
         elif otx >= 1:
-            threat_score -= 2
-            det.append(f"OTX: {otx} threat pulses — low (-2)")
+            threat_score -= 3
+            det.append(f"OTX: {otx} threat pulses — low (-3)")
     else:
         if "OTX" in report.api_keys:
             det.append("OTX: no threat pulses (API key OK) — clean")
@@ -1277,18 +1244,18 @@ def compute_score(report: Report) -> int:
 
     # OTX malware associations
     if threat.otx_malware:
-        penalty = min(len(threat.otx_malware) * 2, 6)
+        penalty = min(len(threat.otx_malware) * 3, 12)
         threat_score -= penalty
         warn.append(f"OTX malware associations: {', '.join(threat.otx_malware)} (-{penalty})")
 
     threat_score = max(0, threat_score)
-    det.append(f"Threat Intelligence: {threat_score}/20")
+    det.append(f"Threat Intelligence: {threat_score}/40")
     report.breakdown["threat_intel"] = threat_score
 
     # ====================================================================
     # Final
     # ====================================================================
-    score = reg_score + geo_score + src_score + trace_score + threat_score
+    score = reg_score + geo_score + anon_score + trace_score + threat_score
     score = max(0, min(score, 100))
 
     report.warnings = warn
@@ -1627,9 +1594,9 @@ CLI flags and real env vars override .env values.
 
     for d in report.details:
         indent = "    "
-        if d.startswith("source-location") or d.startswith("Source-Location"):
+        if d.startswith("source-location") or d.startswith("Source-Location") or "Anonymiz" in d:
             print(f"    {YELLOW}{d}{RESET}")
-        elif any(kw in d.lower() for kw in ["registration", "entity", "geo-registration",
+        elif any(kw in d.lower() for kw in ["registration", "entity", "geo & source",
                                               "traceroute", "threat intelligence"]):
             print(f"    {CYAN}{d}{RESET}")
         else:
